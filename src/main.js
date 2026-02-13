@@ -21,16 +21,21 @@ function looksLikeViteProcess(commandLine = '') {
   return VITE_PATTERN.test(normalized);
 }
 
+const CLAUDE_PATTERNS = [/@anthropic/i, /claude-code/i, /(?:^|\s|\/)claude(?:\s|$)/];
+
+function looksLikeClaudeProcess(commandLine = '') {
+  if (!commandLine) return false;
+  return CLAUDE_PATTERNS.some((p) => p.test(commandLine));
+}
+
 // Process type configuration
 const PROCESS_TYPES = {
   node: {
     label: 'node',
     lsofCommand: 'node',
     classify: (commandLine) => {
-      // If it contains vite, classify as vite instead
-      if (looksLikeViteProcess(commandLine)) {
-        return null;
-      }
+      if (looksLikeClaudeProcess(commandLine)) return null;
+      if (looksLikeViteProcess(commandLine)) return null;
       return 'node';
     }
   },
@@ -38,16 +43,26 @@ const PROCESS_TYPES = {
     label: 'vite',
     lsofCommand: 'node', // Vite runs as node process
     classify: (commandLine) => {
-      if (looksLikeViteProcess(commandLine)) {
-        return 'vite';
-      }
+      if (looksLikeClaudeProcess(commandLine)) return null;
+      if (looksLikeViteProcess(commandLine)) return 'vite';
       return null;
     }
   },
   bun: {
     label: 'bun',
     lsofCommand: 'bun',
-    classify: () => 'bun'
+    classify: (commandLine) => {
+      if (looksLikeClaudeProcess(commandLine)) return null;
+      return 'bun';
+    }
+  },
+  claude: {
+    label: 'claude',
+    lsofCommand: 'node',
+    classify: (commandLine) => {
+      if (looksLikeClaudeProcess(commandLine)) return 'claude';
+      return null;
+    }
   }
 };
 
@@ -181,6 +196,15 @@ async function killPid(pid) {
   return { pid, ok: false, step: 'SIGKILL', error: 'Process still alive after SIGKILL' };
 }
 
+async function stopContainer(containerId) {
+  try {
+    await execAsync(`docker stop ${containerId}`, { timeout: 15000 });
+    return { containerId, ok: true, step: 'docker stop' };
+  } catch (err) {
+    return { containerId, ok: false, step: 'docker stop', error: err.message || String(err) };
+  }
+}
+
 function parseLsofOutputHuman(stdout, processCommand) {
   const lines = stdout.split(/\r?\n/);
   const processes = new Map(); // pid -> { pid, ports: Set<number>, user, command }
@@ -237,8 +261,9 @@ function parseLsofOutputFields(stdout, processCommand) {
       currentPid = pid;
       if (!processes.has(pid)) processes.set(pid, { pid, ports: new Set(), command: processCommand });
     } else if (key === 'n') {
-      // e.g., "TCP *:3000 (LISTEN)" or "TCP 127.0.0.1:5173 (LISTEN)"
-      const m = val.match(/:(\d+)\s*\(LISTEN\)/);
+      // In -F mode: "*:3000" or "127.0.0.1:5173" (no "(LISTEN)" suffix)
+      // We already filter with -sTCP:LISTEN so all matches are listening sockets
+      const m = val.match(/:(\d+)$/);
       const port = m ? Number(m[1]) : null;
       if (currentPid && port) {
         processes.get(currentPid).ports.add(port);
@@ -256,28 +281,89 @@ function isNoProcessError(error) {
   return Boolean(error && (error.code === 1 || error.code === '1'));
 }
 
-// Helper function to classify process type based on command line
-async function classifyProcess(pid, lsofCommand) {
+// Batch-fetch CPU, RSS, and command line for multiple PIDs in one ps call
+async function batchGetProcessStats(pids) {
+  const stats = new Map();
+  if (!pids.length) return stats;
   try {
-    const { stdout } = await execAsync(`ps -p ${pid} -o command=`);
-    const commandLine = stdout.trim();
-
-    // Try to classify based on each enabled process type
-    for (const [typeName, typeConfig] of Object.entries(PROCESS_TYPES)) {
-      if (typeConfig.lsofCommand === lsofCommand) {
-        const classification = typeConfig.classify(commandLine);
-        if (classification) {
-          return classification;
-        }
+    const pidList = pids.join(',');
+    const { stdout } = await execAsync(`ps -p ${pidList} -o pid=,%cpu=,rss=,command=`, { timeout: 4000 });
+    for (const line of stdout.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      const match = line.trim().match(/^(\d+)\s+([\d.]+)\s+(\d+)\s+(.*)$/);
+      if (match) {
+        stats.set(Number(match[1]), {
+          cpu: parseFloat(match[2]),
+          rss: parseInt(match[3], 10),
+          commandLine: match[4]
+        });
       }
     }
-
-    // Default to the lsof command if no classification matches
-    return lsofCommand;
-  } catch (error) {
-    // If we can't get the command line, default to the lsof command
-    return lsofCommand;
+  } catch (_) {
+    // If batch fails, return empty map — callers handle missing entries
   }
+  return stats;
+}
+
+// Classify process type from command line string (synchronous)
+function classifyFromCommandLine(commandLine, lsofCommand) {
+  for (const [, typeConfig] of Object.entries(PROCESS_TYPES)) {
+    if (typeConfig.lsofCommand === lsofCommand) {
+      const classification = typeConfig.classify(commandLine);
+      if (classification) return classification;
+    }
+  }
+  return lsofCommand;
+}
+
+// Walk up from a directory to find the project root name
+// Uses .git as the project boundary — the first directory with both package.json and .git is the root
+// This groups monorepo sub-packages under the root project while respecting git repo boundaries
+function findProjectName(dir) {
+  const root = path.parse(dir).root;
+  const home = os.homedir();
+  let current = dir;
+  let nearestName = null;
+  let outermostProjectName = null;
+  while (current && current !== root) {
+    if (current === home) break;
+    const hasGit = fs.existsSync(path.join(current, '.git'));
+    const hasNodeModules = fs.existsSync(path.join(current, 'node_modules'));
+    let pkgName = null;
+    try {
+      const pkgPath = path.join(current, 'package.json');
+      const data = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      if (data.name) pkgName = data.name;
+    } catch (_) {
+      // no package.json here
+    }
+    if (pkgName && !nearestName) nearestName = pkgName;
+    // Track the outermost directory that looks like an installed project
+    if (pkgName && hasNodeModules) outermostProjectName = pkgName;
+    // A .git directory marks a project boundary — use this name or the nearest we found
+    if (hasGit) return pkgName || nearestName;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return outermostProjectName || nearestName;
+}
+
+// Get the app/project name for a process by looking up its working directory
+async function getProcessAppName(pid) {
+  try {
+    const { stdout } = await execAsync(`lsof -a -d cwd -p ${pid} -Fn`, { timeout: 2000 });
+    const lines = stdout.split(/\r?\n/);
+    for (const line of lines) {
+      if (line.startsWith('n') && line.length > 1) {
+        const cwd = line.slice(1);
+        return findProjectName(cwd) || path.basename(cwd);
+      }
+    }
+  } catch (_) {
+    // ignore
+  }
+  return null;
 }
 
 // Scan for a specific process command (node or bun)
@@ -336,6 +422,150 @@ function scanProcessCommand(processCommand) {
   });
 }
 
+// Scan for non-listening Claude processes (CLI, MCP servers using stdio)
+async function scanClaudeProcesses(seenPids) {
+  const results = [];
+  try {
+    const { stdout } = await execAsync('ps -eo pid=,command=', { timeout: 4000 });
+    for (const line of stdout.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      const match = line.trim().match(/^(\d+)\s+(.*)$/);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      const commandLine = match[2];
+      if (pid === process.pid) continue;
+      if (seenPids.has(pid)) continue;
+      if (!looksLikeClaudeProcess(commandLine)) continue;
+      results.push(pid);
+    }
+  } catch (_) {
+    // ignore
+  }
+  return results;
+}
+
+async function scanDockerContainers() {
+  const results = [];
+  let containerList;
+
+  // List running containers
+  try {
+    const { stdout } = await execAsync('docker ps --format \'{{json .}}\'', { timeout: 4000 });
+    const lines = stdout.split(/\r?\n/).filter(Boolean);
+    containerList = [];
+    for (const line of lines) {
+      try {
+        containerList.push(JSON.parse(line));
+      } catch (_) {
+        // skip malformed lines
+      }
+    }
+  } catch (_) {
+    // docker not available or daemon not running
+    return [];
+  }
+
+  if (!containerList.length) return [];
+
+  const containerIds = containerList.map((c) => c.ID);
+
+  // Batch inspect for Compose labels
+  let inspectData = [];
+  try {
+    const { stdout } = await execAsync(`docker inspect ${containerIds.join(' ')}`, { timeout: 4000 });
+    inspectData = JSON.parse(stdout);
+  } catch (_) {
+    // Fall back to no labels
+  }
+
+  const inspectMap = new Map();
+  for (const info of inspectData) {
+    if (info.Id) {
+      inspectMap.set(info.Id.slice(0, 12), info);
+    }
+  }
+
+  // Batch stats for CPU/memory
+  const statsMap = new Map();
+  try {
+    const { stdout } = await execAsync('docker stats --no-stream --format \'{{json .}}\'', { timeout: 4000 });
+    for (const line of stdout.split(/\r?\n/).filter(Boolean)) {
+      try {
+        const stat = JSON.parse(line);
+        statsMap.set(stat.ID, stat);
+      } catch (_) {
+        // skip
+      }
+    }
+  } catch (_) {
+    // stats not available
+  }
+
+  for (const container of containerList) {
+    const shortId = container.ID;
+    const inspect = inspectMap.get(shortId) || {};
+    const labels = inspect.Config?.Labels || {};
+    const stat = statsMap.get(shortId);
+
+    // Parse ports from docker ps Ports field (e.g. "0.0.0.0:5432->5432/tcp")
+    const ports = [];
+    if (container.Ports) {
+      const portMatches = container.Ports.matchAll(/(?:\d+\.\d+\.\d+\.\d+:)?(\d+)->/g);
+      for (const m of portMatches) {
+        const port = Number(m[1]);
+        if (port && !ports.includes(port)) ports.push(port);
+      }
+    }
+
+    // Project mapping via Compose labels
+    const composeWorkDir = labels['com.docker.compose.project.working_dir'];
+    const composeService = labels['com.docker.compose.service'];
+    let appName = null;
+    if (composeWorkDir) {
+      appName = findProjectName(composeWorkDir);
+    }
+    if (!appName) {
+      appName = container.Names || shortId;
+    }
+
+    // Parse CPU percentage from stats (e.g. "2.31%")
+    let cpu = 0;
+    if (stat?.CPUPerc) {
+      cpu = parseFloat(stat.CPUPerc.replace('%', '')) || 0;
+    }
+
+    // Parse memory from stats (e.g. "51.2MiB")
+    let rss = 0;
+    if (stat?.MemUsage) {
+      const memMatch = stat.MemUsage.match(/([\d.]+)\s*(KiB|MiB|GiB|B)/i);
+      if (memMatch) {
+        const val = parseFloat(memMatch[1]);
+        const unit = memMatch[2].toLowerCase();
+        if (unit === 'gib') rss = Math.round(val * 1048576);
+        else if (unit === 'mib') rss = Math.round(val * 1024);
+        else if (unit === 'kib') rss = Math.round(val);
+        else rss = Math.round(val / 1024); // bytes to KB
+      }
+    }
+
+    const containerName = composeService || container.Names || shortId;
+
+    results.push({
+      pid: null,
+      containerId: shortId,
+      containerName,
+      ports: ports.sort((a, b) => a - b),
+      type: 'docker',
+      appName,
+      cpu,
+      rss,
+      isListening: true,
+    });
+  }
+
+  return results;
+}
+
 // Main function to scan for all enabled process types
 async function scanProcessListeners() {
   const enabledTypes = prefs.getProcessTypes();
@@ -345,35 +575,80 @@ async function scanProcessListeners() {
   // Determine which lsof commands we need to run
   const lsofCommands = new Set();
   for (const [typeName, enabled] of Object.entries(enabledTypes)) {
-    if (enabled && PROCESS_TYPES[typeName]) {
+    if (enabled && PROCESS_TYPES[typeName] && typeName !== 'claude') {
       lsofCommands.add(PROCESS_TYPES[typeName].lsofCommand);
     }
   }
+  // Claude also uses node as lsof command, ensure it's included if enabled
+  if (enabledTypes.claude) {
+    lsofCommands.add('node');
+  }
 
-  // Run lsof for each unique command
+  // Collect all raw processes from lsof
+  const rawProcesses = [];
   for (const lsofCommand of lsofCommands) {
     const processes = await scanProcessCommand(lsofCommand);
+    for (const p of processes) {
+      if (!seenPids.has(p.pid)) {
+        seenPids.add(p.pid);
+        rawProcesses.push({ ...p, lsofCommand });
+      }
+    }
+  }
 
-    // Classify and add processes
-    for (const process of processes) {
-      // Skip if we've already seen this PID (deduplication)
-      if (seenPids.has(process.pid)) continue;
-      seenPids.add(process.pid);
+  // Batch-fetch stats for all PIDs at once
+  const allPids = rawProcesses.map((p) => p.pid);
+  const stats = await batchGetProcessStats(allPids);
 
-      // Classify the process type
-      const processType = await classifyProcess(process.pid, lsofCommand);
+  // Classify each process using batched command line data
+  for (const p of rawProcesses) {
+    const stat = stats.get(p.pid);
+    const commandLine = stat ? stat.commandLine : '';
+    const processType = classifyFromCommandLine(commandLine, p.lsofCommand);
 
-      // Only include if this type is enabled
-      if (enabledTypes[processType]) {
+    if (enabledTypes[processType]) {
+      const appName = await getProcessAppName(p.pid);
+      allProcesses.push({
+        ...p,
+        type: processType,
+        appName: appName || processType,
+        cpu: stat ? stat.cpu : 0,
+        rss: stat ? stat.rss : 0,
+        isListening: true,
+      });
+    }
+  }
+
+  // Scan for non-listening Claude processes
+  if (enabledTypes.claude) {
+    const claudePids = await scanClaudeProcesses(seenPids);
+    if (claudePids.length) {
+      const claudeStats = await batchGetProcessStats(claudePids);
+      for (const pid of claudePids) {
+        seenPids.add(pid);
+        const stat = claudeStats.get(pid);
+        const claudeAppName = await getProcessAppName(pid);
         allProcesses.push({
-          ...process,
-          type: processType
+          pid,
+          ports: [],
+          command: 'node',
+          type: 'claude',
+          appName: claudeAppName,
+          cpu: stat ? stat.cpu : 0,
+          rss: stat ? stat.rss : 0,
+          isListening: false,
         });
       }
     }
   }
 
   return allProcesses;
+}
+
+function formatMemory(rssKB) {
+  if (rssKB >= 1048576) return `${(rssKB / 1048576).toFixed(1)}GB`;
+  if (rssKB >= 1024) return `${Math.round(rssKB / 1024)}MB`;
+  return `${rssKB}KB`;
 }
 
 function buildMenuAndUpdate(procs = []) {
@@ -383,33 +658,110 @@ function buildMenuAndUpdate(procs = []) {
   applyDisplayMode(count);
   tray?.setToolTip(`Node Killer — active processes: ${count}`);
 
-  const items = [];
-
+  // Group processes by project name
+  // Claude processes with a known project join that project group
+  // Claude processes without a project name go into "Claude Code" fallback group
+  const groups = new Map();
   for (const p of latestProcesses) {
-    const ports = Array.isArray(p.ports) ? p.ports : [];
-    let portsLabel = '';
-    if (ports.length === 1) {
-      portsLabel = ` (port ${ports[0]})`;
-    } else if (ports.length > 1) {
-      portsLabel = ` (ports ${ports.join(', ')})`;
+    let groupKey;
+    if (p.type === 'claude' && !p.appName) {
+      groupKey = 'Claude Code';
+    } else {
+      groupKey = p.appName || p.type || 'node';
     }
-    const processType = p.type || 'node';
-    items.push({
-      label: `${processType} ${p.pid}${portsLabel}`,
-      click: async () => {
-        const res = await killPid(p.pid);
-        if (res.ok) {
-          notify('✅ Process terminated', `PID ${p.pid} (${res.step})`);
-        } else {
-          notify('❌ Could not terminate', `PID ${p.pid} — ${res.step} — ${res.error || ''}`);
-        }
-        await performRefresh();
-        scheduleNextRefresh();
-      },
-    });
+    if (!groups.has(groupKey)) groups.set(groupKey, []);
+    groups.get(groupKey).push(p);
   }
 
-  items.push({ type: 'separator' });
+  // Sort groups alphabetically, "Claude Code" last
+  const sortedKeys = Array.from(groups.keys()).sort((a, b) => {
+    if (a === 'Claude Code') return 1;
+    if (b === 'Claude Code') return -1;
+    return a.localeCompare(b);
+  });
+
+  const items = [];
+
+  for (const groupKey of sortedKeys) {
+    const groupProcs = groups.get(groupKey);
+    const groupRss = groupProcs.reduce((sum, p) => sum + (p.rss || 0), 0);
+    const hasClaude = groupProcs.some((p) => p.type === 'claude');
+    const icon = groupKey === 'Claude Code' ? '🤖' : (hasClaude ? '📁🤖' : '📁');
+    const procWord = groupProcs.length === 1 ? 'proc' : 'procs';
+
+    // Group header
+    items.push({
+      label: `${icon} ${groupKey} — ${groupProcs.length} ${procWord}, ${formatMemory(groupRss)}`,
+      enabled: false,
+    });
+
+    // Individual process items
+    for (const p of groupProcs) {
+      const ports = Array.isArray(p.ports) ? p.ports : [];
+      let portLabel = '';
+      if (ports.length === 1) portLabel = ` :${ports[0]}`;
+      else if (ports.length > 1) portLabel = ` :${ports.join(', :')}`;
+
+      const pidLabel = !portLabel ? ` (pid ${p.pid})` : '';
+      const cpuStr = `${(p.cpu || 0).toFixed(0)}% CPU`;
+      const memStr = formatMemory(p.rss || 0);
+      const typeLabel = p.type || 'node';
+
+      items.push({
+        label: `    ${typeLabel}${portLabel}${pidLabel} — ${cpuStr}, ${memStr}`,
+        click: async () => {
+          const res = await killPid(p.pid);
+          if (res.ok) {
+            notify('✅ Process terminated', `PID ${p.pid} (${res.step})`);
+          } else {
+            notify('❌ Could not terminate', `PID ${p.pid} — ${res.step} — ${res.error || ''}`);
+          }
+          await performRefresh();
+          scheduleNextRefresh();
+        },
+      });
+    }
+
+    // Kill group button (if more than 1 process)
+    if (groupProcs.length > 1) {
+      items.push({
+        label: `    Kill all ${groupKey} (${groupProcs.length})`,
+        click: async () => {
+          try {
+            const { response } = await dialog.showMessageBox({
+              type: 'warning',
+              buttons: ['Cancel', 'Kill all'],
+              defaultId: 1,
+              cancelId: 0,
+              message: `Kill ${groupProcs.length} ${groupKey} processes?`,
+              detail: 'Each process will receive SIGTERM. If it survives, SIGKILL is sent next.',
+            });
+            if (response !== 1) return;
+          } catch (e) {
+            console.error('Kill group confirmation failed:', e);
+            return;
+          }
+          let ok = 0;
+          let fail = 0;
+          for (const gp of groupProcs) {
+            const res = await killPid(gp.pid);
+            if (res.ok) ok++;
+            else fail++;
+          }
+          if (fail === 0) {
+            notify('✅ Killed group', `${ok} ${groupKey} processes terminated.`);
+          } else {
+            notify('⚠️ Kill group', `${ok} succeeded, ${fail} failed.`);
+          }
+          await performRefresh();
+          scheduleNextRefresh();
+        },
+      });
+    }
+
+    items.push({ type: 'separator' });
+  }
+
   items.push({
     label: `Kill all (${count})`,
     enabled: count > 0,
@@ -424,9 +776,7 @@ function buildMenuAndUpdate(procs = []) {
           message: count === 1 ? 'Kill 1 process?' : `Kill ${count} processes?`,
           detail: 'Each listed process will receive SIGTERM. If it survives, SIGKILL is sent next.',
         });
-        if (response !== 1) {
-          return;
-        }
+        if (response !== 1) return;
       } catch (e) {
         console.error('Kill all confirmation failed:', e);
         return;
