@@ -12,7 +12,9 @@ const defaults = {
   processTypes: {
     node: true,
     vite: true,
-    bun: true
+    bun: true,
+    claude: true,
+    docker: true
   }
 };
 
@@ -107,7 +109,9 @@ function getProcessTypes() {
   return {
     node: stored?.node !== false,
     vite: stored?.vite !== false,
-    bun: stored?.bun !== false
+    bun: stored?.bun !== false,
+    claude: stored?.claude !== false,
+    docker: stored?.docker !== false
   };
 }
 
@@ -115,7 +119,9 @@ function setProcessTypes(types) {
   const sanitized = {
     node: Boolean(types?.node),
     vite: Boolean(types?.vite),
-    bun: Boolean(types?.bun)
+    bun: Boolean(types?.bun),
+    claude: Boolean(types?.claude),
+    docker: Boolean(types?.docker)
   };
   store.set('processTypes', sanitized);
   return sanitized;
