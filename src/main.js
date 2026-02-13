@@ -63,6 +63,11 @@ const PROCESS_TYPES = {
       if (looksLikeClaudeProcess(commandLine)) return 'claude';
       return null;
     }
+  },
+  docker: {
+    label: 'docker',
+    lsofCommand: null,
+    classify: () => 'docker'
   }
 };
 
@@ -575,7 +580,7 @@ async function scanProcessListeners() {
   // Determine which lsof commands we need to run
   const lsofCommands = new Set();
   for (const [typeName, enabled] of Object.entries(enabledTypes)) {
-    if (enabled && PROCESS_TYPES[typeName] && typeName !== 'claude') {
+    if (enabled && PROCESS_TYPES[typeName] && PROCESS_TYPES[typeName].lsofCommand) {
       lsofCommands.add(PROCESS_TYPES[typeName].lsofCommand);
     }
   }
