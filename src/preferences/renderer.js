@@ -8,6 +8,8 @@ const displayModeRadios = Array.from(document.querySelectorAll('input[name="disp
 const processNodeCheckbox = document.querySelector('#processNode');
 const processViteCheckbox = document.querySelector('#processVite');
 const processBunCheckbox = document.querySelector('#processBun');
+const processClaudeCheckbox = document.querySelector('#processClaude');
+const processDockerCheckbox = document.querySelector('#processDocker');
 const closeButton = document.querySelector('#closeButton');
 const repoLink = document.querySelector('#repoLink');
 
@@ -20,6 +22,7 @@ let state = {
     node: true,
     vite: true,
     bun: true,
+    claude: true,
   },
 };
 let meta = {
@@ -62,6 +65,8 @@ function applyState() {
     processNodeCheckbox.checked = state.processTypes.node !== false;
     processViteCheckbox.checked = state.processTypes.vite !== false;
     processBunCheckbox.checked = state.processTypes.bun !== false;
+    processClaudeCheckbox.checked = state.processTypes.claude !== false;
+    processDockerCheckbox.checked = state.processTypes.docker !== false;
   }
 }
 
@@ -147,6 +152,8 @@ displayModeRadios.forEach((radio) => {
 processNodeCheckbox.addEventListener('change', (e) => handleProcessTypeChange('node', e.target.checked));
 processViteCheckbox.addEventListener('change', (e) => handleProcessTypeChange('vite', e.target.checked));
 processBunCheckbox.addEventListener('change', (e) => handleProcessTypeChange('bun', e.target.checked));
+processClaudeCheckbox.addEventListener('change', (e) => handleProcessTypeChange('claude', e.target.checked));
+processDockerCheckbox.addEventListener('change', (e) => handleProcessTypeChange('docker', e.target.checked));
 closeButton.addEventListener('click', () => window.close());
 repoLink.addEventListener('click', () => {
   prefsApi
