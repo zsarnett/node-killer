@@ -23,6 +23,7 @@ let state = {
     vite: true,
     bun: true,
     claude: true,
+    docker: true,
   },
 };
 let meta = {

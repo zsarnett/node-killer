@@ -8,6 +8,7 @@ const prefs = require('./prefs');
 const { REFRESH_CHOICES, DEFAULT_REFRESH_MS } = prefs;
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 /**
  * ⚡️ Node Killer: a minimal macOS menubar app that hunts down and kills your stray Node.js processes.
@@ -203,7 +204,7 @@ async function killPid(pid) {
 
 async function stopContainer(containerId) {
   try {
-    await execAsync(`docker stop ${containerId}`, { timeout: 15000 });
+    await execFileAsync('docker', ['stop', containerId], { timeout: 15000 });
     return { containerId, ok: true, step: 'docker stop' };
   } catch (err) {
     return { containerId, ok: false, step: 'docker stop', error: err.message || String(err) };
@@ -455,7 +456,7 @@ async function scanDockerContainers() {
 
   // List running containers
   try {
-    const { stdout } = await execAsync('docker ps --format \'{{json .}}\'', { timeout: 4000 });
+    const { stdout } = await execFileAsync('docker', ['ps', '--format', '{{json .}}'], { timeout: 4000 });
     const lines = stdout.split(/\r?\n/).filter(Boolean);
     containerList = [];
     for (const line of lines) {
@@ -477,7 +478,7 @@ async function scanDockerContainers() {
   // Batch inspect for Compose labels
   let inspectData = [];
   try {
-    const { stdout } = await execAsync(`docker inspect ${containerIds.join(' ')}`, { timeout: 4000 });
+    const { stdout } = await execFileAsync('docker', ['inspect', ...containerIds], { timeout: 4000 });
     inspectData = JSON.parse(stdout);
   } catch (_) {
     // Fall back to no labels
@@ -493,7 +494,7 @@ async function scanDockerContainers() {
   // Batch stats for CPU/memory
   const statsMap = new Map();
   try {
-    const { stdout } = await execAsync('docker stats --no-stream --format \'{{json .}}\'', { timeout: 4000 });
+    const { stdout } = await execFileAsync('docker', ['stats', '--no-stream', '--format', '{{json .}}'], { timeout: 4000 });
     for (const line of stdout.split(/\r?\n/).filter(Boolean)) {
       try {
         const stat = JSON.parse(line);
