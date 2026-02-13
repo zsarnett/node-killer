@@ -693,8 +693,14 @@ function buildMenuAndUpdate(procs = []) {
   for (const groupKey of sortedKeys) {
     const groupProcs = groups.get(groupKey);
     const groupRss = groupProcs.reduce((sum, p) => sum + (p.rss || 0), 0);
+    const hasDocker = groupProcs.some((p) => p.type === 'docker');
     const hasClaude = groupProcs.some((p) => p.type === 'claude');
-    const icon = groupKey === 'Claude Code' ? '🤖' : (hasClaude ? '📁🤖' : '📁');
+    let icon;
+    if (groupKey === 'Claude Code') icon = '🤖';
+    else if (hasDocker && hasClaude) icon = '📁🤖🐳';
+    else if (hasDocker) icon = '📁🐳';
+    else if (hasClaude) icon = '📁🤖';
+    else icon = '📁';
     const procWord = groupProcs.length === 1 ? 'proc' : 'procs';
 
     // Group header
@@ -705,24 +711,45 @@ function buildMenuAndUpdate(procs = []) {
 
     // Individual process items
     for (const p of groupProcs) {
-      const ports = Array.isArray(p.ports) ? p.ports : [];
-      let portLabel = '';
-      if (ports.length === 1) portLabel = ` :${ports[0]}`;
-      else if (ports.length > 1) portLabel = ` :${ports.join(', :')}`;
-
-      const pidLabel = !portLabel ? ` (pid ${p.pid})` : '';
-      const cpuStr = `${(p.cpu || 0).toFixed(0)}% CPU`;
-      const memStr = formatMemory(p.rss || 0);
-      const typeLabel = p.type || 'node';
+      let itemLabel;
+      if (p.containerId) {
+        const ports = Array.isArray(p.ports) ? p.ports : [];
+        let portLabel = '';
+        if (ports.length === 1) portLabel = ` :${ports[0]}`;
+        else if (ports.length > 1) portLabel = ` :${ports.join(', :')}`;
+        const cpuStr = `${(p.cpu || 0).toFixed(0)}% CPU`;
+        const memStr = formatMemory(p.rss || 0);
+        itemLabel = `    🐳 ${p.containerName}${portLabel} — ${cpuStr}, ${memStr}`;
+      } else {
+        const ports = Array.isArray(p.ports) ? p.ports : [];
+        let portLabel = '';
+        if (ports.length === 1) portLabel = ` :${ports[0]}`;
+        else if (ports.length > 1) portLabel = ` :${ports.join(', :')}`;
+        const pidLabel = !portLabel ? ` (pid ${p.pid})` : '';
+        const cpuStr = `${(p.cpu || 0).toFixed(0)}% CPU`;
+        const memStr = formatMemory(p.rss || 0);
+        const typeLabel = p.type || 'node';
+        itemLabel = `    ${typeLabel}${portLabel}${pidLabel} — ${cpuStr}, ${memStr}`;
+      }
 
       items.push({
-        label: `    ${typeLabel}${portLabel}${pidLabel} — ${cpuStr}, ${memStr}`,
+        label: itemLabel,
         click: async () => {
-          const res = await killPid(p.pid);
-          if (res.ok) {
-            notify('✅ Process terminated', `PID ${p.pid} (${res.step})`);
+          let res;
+          if (p.containerId) {
+            res = await stopContainer(p.containerId);
+            if (res.ok) {
+              notify('✅ Container stopped', `${p.containerName} (${p.containerId})`);
+            } else {
+              notify('❌ Could not stop container', `${p.containerName} — ${res.error || ''}`);
+            }
           } else {
-            notify('❌ Could not terminate', `PID ${p.pid} — ${res.step} — ${res.error || ''}`);
+            res = await killPid(p.pid);
+            if (res.ok) {
+              notify('✅ Process terminated', `PID ${p.pid} (${res.step})`);
+            } else {
+              notify('❌ Could not terminate', `PID ${p.pid} — ${res.step} — ${res.error || ''}`);
+            }
           }
           await performRefresh();
           scheduleNextRefresh();
@@ -752,7 +779,12 @@ function buildMenuAndUpdate(procs = []) {
           let ok = 0;
           let fail = 0;
           for (const gp of groupProcs) {
-            const res = await killPid(gp.pid);
+            let res;
+            if (gp.containerId) {
+              res = await stopContainer(gp.containerId);
+            } else {
+              res = await killPid(gp.pid);
+            }
             if (res.ok) ok++;
             else fail++;
           }
@@ -794,11 +826,17 @@ function buildMenuAndUpdate(procs = []) {
       const failed = [];
       const snapshot = [...latestProcesses];
       for (const processInfo of snapshot) {
-        const res = await killPid(processInfo.pid);
+        let res;
+        if (processInfo.containerId) {
+          res = await stopContainer(processInfo.containerId);
+        } else {
+          res = await killPid(processInfo.pid);
+        }
         if (res.ok) ok++;
         else {
           fail++;
-          failed.push(`${processInfo.pid} (${res.step})`);
+          const id = processInfo.containerId || processInfo.pid;
+          failed.push(`${id} (${res.step})`);
         }
       }
       if (fail === 0) {
