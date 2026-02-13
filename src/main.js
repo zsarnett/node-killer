@@ -642,6 +642,14 @@ async function scanProcessListeners() {
     }
   }
 
+  // Scan Docker containers
+  if (enabledTypes.docker) {
+    const dockerContainers = await scanDockerContainers();
+    for (const container of dockerContainers) {
+      allProcesses.push(container);
+    }
+  }
+
   return allProcesses;
 }
 
