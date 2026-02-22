@@ -29,48 +29,20 @@ function looksLikeClaudeProcess(commandLine = '') {
   return CLAUDE_PATTERNS.some((p) => p.test(commandLine));
 }
 
-// Process type configuration
-const PROCESS_TYPES = {
-  node: {
-    label: 'node',
-    lsofCommand: 'node',
-    classify: (commandLine) => {
-      if (looksLikeClaudeProcess(commandLine)) return null;
-      if (looksLikeViteProcess(commandLine)) return null;
-      return 'node';
-    }
-  },
-  vite: {
-    label: 'vite',
-    lsofCommand: 'node', // Vite runs as node process
-    classify: (commandLine) => {
-      if (looksLikeClaudeProcess(commandLine)) return null;
-      if (looksLikeViteProcess(commandLine)) return 'vite';
-      return null;
-    }
-  },
-  bun: {
-    label: 'bun',
-    lsofCommand: 'bun',
-    classify: (commandLine) => {
-      if (looksLikeClaudeProcess(commandLine)) return null;
-      return 'bun';
-    }
-  },
-  claude: {
-    label: 'claude',
-    lsofCommand: 'node',
-    classify: (commandLine) => {
-      if (looksLikeClaudeProcess(commandLine)) return 'claude';
-      return null;
-    }
-  },
-  docker: {
-    label: 'docker',
-    lsofCommand: null,
-    classify: () => 'docker'
-  }
-};
+// Command name detection helpers
+const NODE_COMMAND_PATTERN = /^(node|nodejs)$/i;
+const NODE_RELATED_COMMANDS = /^(tsx|ts-node|npx)$/i;
+const BUN_COMMAND_PATTERN = /^bun/i;
+
+function isNodeCommandName(name) {
+  if (!name) return false;
+  return NODE_COMMAND_PATTERN.test(name) || name.toLowerCase().startsWith('node') || NODE_RELATED_COMMANDS.test(name);
+}
+
+function isBunCommandName(name) {
+  if (!name) return false;
+  return BUN_COMMAND_PATTERN.test(name);
+}
 
 let tray = null;
 let refreshTimeout = null;
@@ -211,9 +183,9 @@ async function stopContainer(containerId) {
   }
 }
 
-function parseLsofOutputHuman(stdout, processCommand) {
+function parseLsofOutputHuman(stdout) {
   const lines = stdout.split(/\r?\n/);
-  const processes = new Map(); // pid -> { pid, ports: Set<number>, user, command }
+  const processes = new Map(); // pid -> { pid, ports: Set<number>, commandName }
 
   for (const line of lines) {
     if (!line || line.startsWith('COMMAND') || !/LISTEN/.test(line)) continue;
@@ -222,16 +194,9 @@ function parseLsofOutputHuman(stdout, processCommand) {
     const parts = compact.split(' ');
     if (parts.length < 2) continue;
 
-    const command = parts[0];
+    const commandName = parts[0];
     const pidNum = Number(parts[1]);
-    const user = parts[2] || '';
 
-    // Keep processes based on the command filter
-    if (processCommand === 'node') {
-      if (!(command === 'node' || /\bnode(js)?\b/.test(command))) continue;
-    } else if (processCommand === 'bun') {
-      if (!(command === 'bun' || /\bbun\b/.test(command))) continue;
-    }
     if (!Number.isFinite(pidNum)) continue;
 
     // Extract port(s)
@@ -239,22 +204,21 @@ function parseLsofOutputHuman(stdout, processCommand) {
     const port = m ? Number(m[1]) : null;
 
     if (!processes.has(pidNum)) {
-      processes.set(pidNum, { pid: pidNum, user, ports: new Set(), command: processCommand });
+      processes.set(pidNum, { pid: pidNum, ports: new Set(), commandName });
     }
     if (port) processes.get(pidNum).ports.add(port);
   }
 
   return Array.from(processes.values()).map((p) => ({
     pid: p.pid,
-    user: p.user,
     ports: Array.from(p.ports).sort((a, b) => a - b),
-    command: p.command,
+    commandName: p.commandName,
   }));
 }
 
-function parseLsofOutputFields(stdout, processCommand) {
+function parseLsofOutputFields(stdout) {
   // Parse output from: lsof -F pcPn ...
-  const processes = new Map(); // pid -> { pid, ports: Set<number>, user?: string, command }
+  const processes = new Map(); // pid -> { pid, ports: Set<number>, commandName }
   let currentPid = null;
   const lines = stdout.split(/\r?\n/);
   for (const line of lines) {
@@ -265,13 +229,17 @@ function parseLsofOutputFields(stdout, processCommand) {
       const pid = Number(val);
       if (!Number.isFinite(pid)) { currentPid = null; continue; }
       currentPid = pid;
-      if (!processes.has(pid)) processes.set(pid, { pid, ports: new Set(), command: processCommand });
+      if (!processes.has(pid)) processes.set(pid, { pid, ports: new Set(), commandName: '' });
+    } else if (key === 'c') {
+      if (currentPid && processes.has(currentPid)) {
+        processes.get(currentPid).commandName = val;
+      }
     } else if (key === 'n') {
       // In -F mode: "*:3000" or "127.0.0.1:5173" (no "(LISTEN)" suffix)
       // We already filter with -sTCP:LISTEN so all matches are listening sockets
       const m = val.match(/:(\d+)$/);
       const port = m ? Number(m[1]) : null;
-      if (currentPid && port) {
+      if (currentPid && port && processes.has(currentPid)) {
         processes.get(currentPid).ports.add(port);
       }
     }
@@ -279,7 +247,7 @@ function parseLsofOutputFields(stdout, processCommand) {
   return Array.from(processes.values()).map((p) => ({
     pid: p.pid,
     ports: Array.from(p.ports).sort((a, b) => a - b),
-    command: p.command,
+    commandName: p.commandName,
   }));
 }
 
@@ -311,15 +279,31 @@ async function batchGetProcessStats(pids) {
   return stats;
 }
 
-// Classify process type from command line string (synchronous)
-function classifyFromCommandLine(commandLine, lsofCommand) {
-  for (const [, typeConfig] of Object.entries(PROCESS_TYPES)) {
-    if (typeConfig.lsofCommand === lsofCommand) {
-      const classification = typeConfig.classify(commandLine);
-      if (classification) return classification;
-    }
+// Classify process type from command name (lsof) and command line (ps).
+// Returns the most specific enabled type, with fallback to broader types.
+// e.g. a Vite process with vite disabled but node enabled → 'node'
+function classifyProcess(commandName, commandLine, enabledTypes) {
+  if (isBunCommandName(commandName)) {
+    if (looksLikeClaudeProcess(commandLine) && enabledTypes.claude) return 'claude';
+    if (enabledTypes.bun) return 'bun';
+    return null;
   }
-  return lsofCommand;
+
+  if (isNodeCommandName(commandName)) {
+    if (looksLikeClaudeProcess(commandLine) && enabledTypes.claude) return 'claude';
+    if (looksLikeViteProcess(commandLine) && enabledTypes.vite) return 'vite';
+    if (enabledTypes.node) return 'node';
+    return null;
+  }
+
+  // For unknown command names, check if the binary is actually node
+  if (commandLine && /(?:^|\/)node(?:\.exe)?\s/.test(commandLine)) {
+    if (looksLikeClaudeProcess(commandLine) && enabledTypes.claude) return 'claude';
+    if (looksLikeViteProcess(commandLine) && enabledTypes.vite) return 'vite';
+    if (enabledTypes.node) return 'node';
+  }
+
+  return null;
 }
 
 // Walk up from a directory to find the project root name
@@ -372,29 +356,26 @@ async function getProcessAppName(pid) {
   return null;
 }
 
-// Scan for a specific process command (node or bun)
-function scanProcessCommand(processCommand) {
+// Scan ALL listening TCP processes (single broad scan, no -c filter)
+function scanListeningProcesses() {
   return new Promise((resolve) => {
     const user = os.userInfo().username;
     const allUsers = prefs.getAllUsers();
-    const onlyMine = !allUsers;
-    // Use field format to drastically reduce output size
-    const args = ['-nP', '-iTCP', '-sTCP:LISTEN', '-a', '-c', processCommand, '-F', 'pcPn'];
-    if (onlyMine) {
+    const args = ['-nP', '-iTCP', '-sTCP:LISTEN', '-F', 'pcPn'];
+    if (!allUsers) {
       args.push('-u', user);
     }
 
     execFile('lsof', args, { timeout: 4000, maxBuffer: 10 * 1024 * 1024 }, (error, stdout) => {
       if (error) {
         if (isNoProcessError(error)) {
-          // lsof exit code 1 == no matching processes
           resolve([]);
           return;
         }
 
         // Fallback to human parse without -F if field mode failed for any reason
-        const humanArgs = ['-nP', '-iTCP', '-sTCP:LISTEN', '-a', '-c', processCommand];
-        if (onlyMine) {
+        const humanArgs = ['-nP', '-iTCP', '-sTCP:LISTEN'];
+        if (!allUsers) {
           humanArgs.push('-u', user);
         }
 
@@ -404,24 +385,23 @@ function scanProcessCommand(processCommand) {
               resolve([]);
               return;
             }
-            console.debug(`[lsof ${processCommand}] error:`, e2.message || e2);
+            console.debug('[lsof] error:', e2.message || e2);
             resolve([]);
             return;
           }
           try {
-            resolve(parseLsofOutputHuman(out2 || '', processCommand));
+            resolve(parseLsofOutputHuman(out2 || ''));
           } catch (e) {
-            console.error(`[parseLsofOutputHuman ${processCommand}] failed:`, e);
+            console.error('[parseLsofOutputHuman] failed:', e);
             resolve([]);
           }
         });
         return;
       }
       try {
-        const results = parseLsofOutputFields(stdout || '', processCommand);
-        resolve(results);
+        resolve(parseLsofOutputFields(stdout || ''));
       } catch (e) {
-        console.error(`[parseLsofOutputFields ${processCommand}] failed:`, e);
+        console.error('[parseLsofOutputFields] failed:', e);
         resolve([]);
       }
     });
@@ -578,50 +558,72 @@ async function scanProcessListeners() {
   const allProcesses = [];
   const seenPids = new Set();
 
-  // Determine which lsof commands we need to run
-  const lsofCommands = new Set();
-  for (const [typeName, enabled] of Object.entries(enabledTypes)) {
-    if (enabled && PROCESS_TYPES[typeName] && PROCESS_TYPES[typeName].lsofCommand) {
-      lsofCommands.add(PROCESS_TYPES[typeName].lsofCommand);
-    }
-  }
-  // Claude also uses node as lsof command, ensure it's included if enabled
-  if (enabledTypes.claude) {
-    lsofCommands.add('node');
-  }
+  // Single broad scan for all listening TCP processes
+  const needsTcpScan = enabledTypes.node || enabledTypes.vite || enabledTypes.bun || enabledTypes.claude;
 
-  // Collect all raw processes from lsof
-  const rawProcesses = [];
-  for (const lsofCommand of lsofCommands) {
-    const processes = await scanProcessCommand(lsofCommand);
-    for (const p of processes) {
-      if (!seenPids.has(p.pid)) {
-        seenPids.add(p.pid);
-        rawProcesses.push({ ...p, lsofCommand });
-      }
-    }
-  }
+  if (needsTcpScan) {
+    const rawProcesses = await scanListeningProcesses();
 
-  // Batch-fetch stats for all PIDs at once
-  const allPids = rawProcesses.map((p) => p.pid);
-  const stats = await batchGetProcessStats(allPids);
+    // Primary pass: processes with recognized command names (node, bun, tsx, etc.)
+    const recognized = rawProcesses.filter((p) => {
+      return isNodeCommandName(p.commandName) || isBunCommandName(p.commandName);
+    });
 
-  // Classify each process using batched command line data
-  for (const p of rawProcesses) {
-    const stat = stats.get(p.pid);
-    const commandLine = stat ? stat.commandLine : '';
-    const processType = classifyFromCommandLine(commandLine, p.lsofCommand);
+    const recognizedPids = recognized.map((p) => p.pid);
+    const stats = await batchGetProcessStats(recognizedPids);
 
-    if (enabledTypes[processType]) {
+    for (const p of recognized) {
+      if (seenPids.has(p.pid)) continue;
+      const stat = stats.get(p.pid);
+      const commandLine = stat ? stat.commandLine : '';
+      const processType = classifyProcess(p.commandName, commandLine, enabledTypes);
+      if (!processType) continue;
+
+      seenPids.add(p.pid);
       const appName = await getProcessAppName(p.pid);
       allProcesses.push({
-        ...p,
+        pid: p.pid,
+        ports: p.ports,
+        command: p.commandName,
         type: processType,
         appName: appName || processType,
         cpu: stat ? stat.cpu : 0,
         rss: stat ? stat.rss : 0,
         isListening: true,
       });
+    }
+
+    // Secondary pass: check remaining processes for node binary in command line.
+    // Catches processes with non-standard command names (custom binaries, wrappers).
+    if (enabledTypes.node || enabledTypes.vite || enabledTypes.claude) {
+      const remaining = rawProcesses.filter((p) => !seenPids.has(p.pid));
+      if (remaining.length > 0) {
+        const remainingPids = remaining.map((p) => p.pid);
+        const remainingStats = await batchGetProcessStats(remainingPids);
+
+        for (const p of remaining) {
+          if (seenPids.has(p.pid)) continue;
+          const stat = remainingStats.get(p.pid);
+          const commandLine = stat ? stat.commandLine : '';
+          if (!commandLine) continue;
+
+          const processType = classifyProcess(p.commandName, commandLine, enabledTypes);
+          if (!processType) continue;
+
+          seenPids.add(p.pid);
+          const appName = await getProcessAppName(p.pid);
+          allProcesses.push({
+            pid: p.pid,
+            ports: p.ports,
+            command: p.commandName,
+            type: processType,
+            appName: appName || processType,
+            cpu: stat ? stat.cpu : 0,
+            rss: stat ? stat.rss : 0,
+            isListening: true,
+          });
+        }
+      }
     }
   }
 
