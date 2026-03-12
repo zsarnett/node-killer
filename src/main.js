@@ -839,7 +839,9 @@ async function scanProcessListeners() {
     }
   }
 
-  return allProcesses;
+  // Filter out stuck processes (uninterruptible wait / zombies orphaned to launchd)
+  // — they can't be killed and use no real resources
+  return allProcesses.filter((p) => !p.isStuck);
 }
 
 function formatMemory(rssKB) {
