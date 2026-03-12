@@ -261,15 +261,16 @@ async function batchGetProcessStats(pids) {
   if (!pids.length) return stats;
   try {
     const pidList = pids.join(',');
-    const { stdout } = await execAsync(`ps -p ${pidList} -o pid=,%cpu=,rss=,command=`, { timeout: 4000 });
+    const { stdout } = await execAsync(`ps -p ${pidList} -o pid=,%cpu=,rss=,etime=,command=`, { timeout: 4000 });
     for (const line of stdout.split(/\r?\n/)) {
       if (!line.trim()) continue;
-      const match = line.trim().match(/^(\d+)\s+([\d.]+)\s+(\d+)\s+(.*)$/);
+      const match = line.trim().match(/^(\d+)\s+([\d.]+)\s+(\d+)\s+([\d:.-]+)\s+(.*)$/);
       if (match) {
         stats.set(Number(match[1]), {
           cpu: parseFloat(match[2]),
           rss: parseInt(match[3], 10),
-          commandLine: match[4]
+          etime: match[4].trim(),
+          commandLine: match[5]
         });
       }
     }
@@ -277,6 +278,56 @@ async function batchGetProcessStats(pids) {
     // If batch fails, return empty map — callers handle missing entries
   }
   return stats;
+}
+
+// Parse ps etime format (e.g. "02:30", "01:02:30", "2-01:02:30") into a human-friendly string
+function formatUptime(etime) {
+  if (!etime) return '';
+  // etime formats: "MM:SS", "HH:MM:SS", "D-HH:MM:SS"
+  const dayMatch = etime.match(/^(\d+)-(\d+):(\d+):(\d+)$/);
+  if (dayMatch) {
+    const days = parseInt(dayMatch[1], 10);
+    const hours = parseInt(dayMatch[2], 10);
+    if (days > 0) return hours > 0 ? `${days}d${hours}h` : `${days}d`;
+    return `${hours}h`;
+  }
+  const hmsMatch = etime.match(/^(\d+):(\d+):(\d+)$/);
+  if (hmsMatch) {
+    const hours = parseInt(hmsMatch[1], 10);
+    const mins = parseInt(hmsMatch[2], 10);
+    if (hours > 0) return mins > 0 ? `${hours}h${mins}m` : `${hours}h`;
+    return `${mins}m`;
+  }
+  const msMatch = etime.match(/^(\d+):(\d+)$/);
+  if (msMatch) {
+    const mins = parseInt(msMatch[1], 10);
+    if (mins > 0) return `${mins}m`;
+    return `<1m`;
+  }
+  return '';
+}
+
+// Extract a short meaningful summary from a full command line
+function summarizeCommand(commandLine) {
+  if (!commandLine) return '';
+  // Strip the leading binary path (e.g. /usr/local/bin/node, bun)
+  let cmd = commandLine.replace(/^\/\S+\/(?:node|bun|tsx|ts-node|npx)\s+/, '');
+  cmd = cmd.replace(/^(?:node|bun|tsx|ts-node|npx)\s+/, '');
+  // If it starts with a node_modules/.bin/ path, extract the tool name + args
+  const binMatch = cmd.match(/(?:node_modules\/\.bin\/|\.bin\/)(\S+)(.*)/);
+  if (binMatch) {
+    const tool = binMatch[1];
+    const args = binMatch[2].trim();
+    // For known tools, show tool + first meaningful arg
+    const shortArgs = args.split(/\s+/).filter((a) => !a.startsWith('-')).slice(0, 2).join(' ');
+    return shortArgs ? `${tool} ${shortArgs}` : tool;
+  }
+  // If it's a script path, show the basename + first arg
+  const parts = cmd.split(/\s+/);
+  const script = path.basename(parts[0] || '');
+  if (!script) return '';
+  const argParts = parts.slice(1).filter((a) => !a.startsWith('-')).slice(0, 2).join(' ');
+  return argParts ? `${script} ${argParts}` : script;
 }
 
 // Classify process type from command name (lsof) and command line (ps).
@@ -621,6 +672,8 @@ async function scanProcessListeners() {
         appName: appName || processType,
         cpu: stat ? stat.cpu : 0,
         rss: stat ? stat.rss : 0,
+        uptime: stat ? formatUptime(stat.etime) : '',
+        commandSummary: stat ? summarizeCommand(stat.commandLine) : '',
         isListening: true,
       });
     }
@@ -652,6 +705,8 @@ async function scanProcessListeners() {
             appName: appName || processType,
             cpu: stat ? stat.cpu : 0,
             rss: stat ? stat.rss : 0,
+            uptime: stat ? formatUptime(stat.etime) : '',
+            commandSummary: stat ? summarizeCommand(stat.commandLine) : '',
             isListening: true,
           });
         }
@@ -677,6 +732,8 @@ async function scanProcessListeners() {
           appName: appName || p.type,
           cpu: stat ? stat.cpu : 0,
           rss: stat ? stat.rss : 0,
+          uptime: stat ? formatUptime(stat.etime) : '',
+          commandSummary: stat ? summarizeCommand(stat.commandLine) : '',
           isListening: false,
         });
       }
@@ -700,6 +757,8 @@ async function scanProcessListeners() {
           appName: claudeAppName,
           cpu: stat ? stat.cpu : 0,
           rss: stat ? stat.rss : 0,
+          uptime: stat ? formatUptime(stat.etime) : '',
+          commandSummary: stat ? summarizeCommand(stat.commandLine) : '',
           isListening: false,
         });
       }
@@ -783,7 +842,8 @@ function buildMenuAndUpdate(procs = []) {
         else if (ports.length > 1) portLabel = ` :${ports.join(', :')}`;
         const cpuStr = `${(p.cpu || 0).toFixed(0)}% CPU`;
         const memStr = formatMemory(p.rss || 0);
-        itemLabel = `    🐳 ${p.containerName}${portLabel} — ${cpuStr}, ${memStr}`;
+        const uptimeLabel = p.uptime ? `, ${p.uptime}` : '';
+        itemLabel = `    🐳 ${p.containerName}${portLabel} — ${cpuStr}, ${memStr}${uptimeLabel}`;
       } else {
         const ports = Array.isArray(p.ports) ? p.ports : [];
         let portLabel = '';
@@ -793,7 +853,9 @@ function buildMenuAndUpdate(procs = []) {
         const cpuStr = `${(p.cpu || 0).toFixed(0)}% CPU`;
         const memStr = formatMemory(p.rss || 0);
         const typeLabel = p.type || 'node';
-        itemLabel = `    ${typeLabel}${portLabel}${pidLabel} — ${cpuStr}, ${memStr}`;
+        const summaryLabel = p.commandSummary ? ` [${p.commandSummary}]` : '';
+        const uptimeLabel = p.uptime ? `, ${p.uptime}` : '';
+        itemLabel = `    ${typeLabel}${portLabel}${pidLabel}${summaryLabel} — ${cpuStr}, ${memStr}${uptimeLabel}`;
       }
 
       items.push({
