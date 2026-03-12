@@ -147,8 +147,46 @@ function isPidAlive(pid) {
   }
 }
 
+// Check if a process is a zombie (state Z) and return its parent PID
+async function getZombieParent(pid) {
+  try {
+    const { stdout } = await execAsync(`ps -p ${pid} -o state=,ppid=`, { timeout: 2000 });
+    const match = stdout.trim().match(/^(\S+)\s+(\d+)$/);
+    if (match && match[1].startsWith('Z')) {
+      return Number(match[2]);
+    }
+  } catch (_) {
+    // process may already be gone
+  }
+  return null;
+}
+
 async function killPid(pid) {
-  // Try SIGTERM then SIGKILL
+  // Check if zombie first — signals don't work on zombies, must kill parent
+  const zombieParent = await getZombieParent(pid);
+  if (zombieParent && zombieParent > 1) {
+    try {
+      process.kill(zombieParent, 'SIGTERM');
+    } catch (err) {
+      return { pid, ok: false, step: 'zombie-parent SIGTERM', error: err.message || String(err) };
+    }
+    await sleep(500);
+    if (!isPidAlive(pid)) {
+      return { pid, ok: true, step: 'zombie-parent SIGTERM' };
+    }
+    try {
+      process.kill(zombieParent, 'SIGKILL');
+    } catch (err) {
+      return { pid, ok: false, step: 'zombie-parent SIGKILL', error: err.message || String(err) };
+    }
+    await sleep(300);
+    if (!isPidAlive(pid)) {
+      return { pid, ok: true, step: 'zombie-parent SIGKILL' };
+    }
+    return { pid, ok: false, step: 'zombie-parent SIGKILL', error: 'Zombie still present after killing parent' };
+  }
+
+  // Try SIGTERM first
   try {
     process.kill(pid, 'SIGTERM');
   } catch (err) {
@@ -160,6 +198,7 @@ async function killPid(pid) {
     return { pid, ok: true, step: 'SIGTERM' };
   }
 
+  // Try SIGKILL
   try {
     process.kill(pid, 'SIGKILL');
   } catch (err) {
@@ -169,6 +208,18 @@ async function killPid(pid) {
   await sleep(300);
   if (!isPidAlive(pid)) {
     return { pid, ok: true, step: 'SIGKILL' };
+  }
+
+  // Last resort: kill the entire process group
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch (_) {
+    // may fail if pid isn't a group leader — that's fine
+  }
+
+  await sleep(300);
+  if (!isPidAlive(pid)) {
+    return { pid, ok: true, step: 'SIGKILL (group)' };
   }
 
   return { pid, ok: false, step: 'SIGKILL', error: 'Process still alive after SIGKILL' };
@@ -261,16 +312,17 @@ async function batchGetProcessStats(pids) {
   if (!pids.length) return stats;
   try {
     const pidList = pids.join(',');
-    const { stdout } = await execAsync(`ps -p ${pidList} -o pid=,%cpu=,rss=,etime=,command=`, { timeout: 4000 });
+    const { stdout } = await execAsync(`ps -p ${pidList} -o pid=,state=,%cpu=,rss=,etime=,command=`, { timeout: 4000 });
     for (const line of stdout.split(/\r?\n/)) {
       if (!line.trim()) continue;
-      const match = line.trim().match(/^(\d+)\s+([\d.]+)\s+(\d+)\s+([\d:.-]+)\s+(.*)$/);
+      const match = line.trim().match(/^(\d+)\s+(\S+)\s+([\d.]+)\s+(\d+)\s+([\d:.-]+)\s+(.*)$/);
       if (match) {
         stats.set(Number(match[1]), {
-          cpu: parseFloat(match[2]),
-          rss: parseInt(match[3], 10),
-          etime: match[4].trim(),
-          commandLine: match[5]
+          state: match[2],
+          cpu: parseFloat(match[3]),
+          rss: parseInt(match[4], 10),
+          etime: match[5].trim(),
+          commandLine: match[6]
         });
       }
     }
@@ -674,6 +726,7 @@ async function scanProcessListeners() {
         rss: stat ? stat.rss : 0,
         uptime: stat ? formatUptime(stat.etime) : '',
         commandSummary: stat ? summarizeCommand(stat.commandLine) : '',
+        isZombie: stat ? stat.state?.startsWith('Z') : false,
         isListening: true,
       });
     }
@@ -734,6 +787,7 @@ async function scanProcessListeners() {
           rss: stat ? stat.rss : 0,
           uptime: stat ? formatUptime(stat.etime) : '',
           commandSummary: stat ? summarizeCommand(stat.commandLine) : '',
+          isZombie: stat ? stat.state?.startsWith('Z') : false,
           isListening: false,
         });
       }
@@ -759,6 +813,7 @@ async function scanProcessListeners() {
           rss: stat ? stat.rss : 0,
           uptime: stat ? formatUptime(stat.etime) : '',
           commandSummary: stat ? summarizeCommand(stat.commandLine) : '',
+          isZombie: stat ? stat.state?.startsWith('Z') : false,
           isListening: false,
         });
       }
@@ -855,7 +910,8 @@ function buildMenuAndUpdate(procs = []) {
         const typeLabel = p.type || 'node';
         const summaryLabel = p.commandSummary ? ` [${p.commandSummary}]` : '';
         const uptimeLabel = p.uptime ? `, ${p.uptime}` : '';
-        itemLabel = `    ${typeLabel}${portLabel}${pidLabel}${summaryLabel} — ${cpuStr}, ${memStr}${uptimeLabel}`;
+        const zombieLabel = p.isZombie ? ' (zombie)' : '';
+        itemLabel = `    ${typeLabel}${portLabel}${pidLabel}${summaryLabel} — ${cpuStr}, ${memStr}${uptimeLabel}${zombieLabel}`;
       }
 
       items.push({
