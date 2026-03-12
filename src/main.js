@@ -408,6 +408,38 @@ function scanListeningProcesses() {
   });
 }
 
+// Scan for non-listening node/vite/bun processes via ps
+async function scanNonListeningProcesses(seenPids, enabledTypes) {
+  const results = [];
+  try {
+    const { stdout } = await execAsync('ps -eo pid=,command=', { timeout: 4000 });
+    for (const line of stdout.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      const match = line.trim().match(/^(\d+)\s+(.*)$/);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      const commandLine = match[2];
+      if (pid === process.pid) continue;
+      if (seenPids.has(pid)) continue;
+
+      // Extract the base command name from the command line
+      const cmdParts = commandLine.split(/\s+/);
+      const cmdBase = path.basename(cmdParts[0] || '');
+
+      const processType = classifyProcess(cmdBase, commandLine, enabledTypes);
+      if (!processType) continue;
+
+      // Skip claude processes here -- they have their own scanner
+      if (processType === 'claude') continue;
+
+      results.push({ pid, commandLine, type: processType });
+    }
+  } catch (_) {
+    // ignore
+  }
+  return results;
+}
+
 // Scan for non-listening Claude processes (CLI, MCP servers using stdio)
 async function scanClaudeProcesses(seenPids) {
   const results = [];
@@ -623,6 +655,30 @@ async function scanProcessListeners() {
             isListening: true,
           });
         }
+      }
+    }
+  }
+
+  // Scan for non-listening node/vite/bun processes
+  if (prefs.getIncludeNonListening() && (enabledTypes.node || enabledTypes.vite || enabledTypes.bun)) {
+    const nonListening = await scanNonListeningProcesses(seenPids, enabledTypes);
+    if (nonListening.length) {
+      const nlPids = nonListening.map((p) => p.pid);
+      const nlStats = await batchGetProcessStats(nlPids);
+      for (const p of nonListening) {
+        seenPids.add(p.pid);
+        const stat = nlStats.get(p.pid);
+        const appName = await getProcessAppName(p.pid);
+        allProcesses.push({
+          pid: p.pid,
+          ports: [],
+          command: 'node',
+          type: p.type,
+          appName: appName || p.type,
+          cpu: stat ? stat.cpu : 0,
+          rss: stat ? stat.rss : 0,
+          isListening: false,
+        });
       }
     }
   }
@@ -1077,6 +1133,14 @@ ipcMain.handle('prefs:set-refresh', async (_event, value) => {
 
 ipcMain.handle('prefs:set-allUsers', async (_event, value) => {
   const next = prefs.setAllUsers(Boolean(value));
+  await performRefresh();
+  scheduleNextRefresh();
+  rebuildMenuFromCache();
+  return buildPreferencesPayload();
+});
+
+ipcMain.handle('prefs:set-includeNonListening', async (_event, value) => {
+  prefs.setIncludeNonListening(Boolean(value));
   await performRefresh();
   scheduleNextRefresh();
   rebuildMenuFromCache();

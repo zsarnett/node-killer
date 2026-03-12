@@ -46,6 +46,7 @@ assets/icons/                # App icon (.icns)
 | `refreshMs` | number \| 'paused' | 5000 |
 | `allUsers` | boolean | false |
 | `displayMode` | string | 'number' |
+| `includeNonListening` | boolean | true |
 | `processTypes` | {node, vite, bun} | all true |
 
 ## No Test Suite

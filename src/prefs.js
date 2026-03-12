@@ -8,6 +8,7 @@ const defaults = {
   autoLaunch: false,
   refreshMs: DEFAULT_REFRESH_MS,
   allUsers: false,
+  includeNonListening: true,
   displayMode: 'number',
   processTypes: {
     node: true,
@@ -90,6 +91,16 @@ function setAllUsers(value) {
   return next;
 }
 
+function getIncludeNonListening() {
+  return store.get('includeNonListening') !== false;
+}
+
+function setIncludeNonListening(value) {
+  const next = Boolean(value);
+  store.set('includeNonListening', next);
+  return next;
+}
+
 function getDisplayMode() {
   const value = store.get('displayMode');
   if (DISPLAY_MODES.includes(value)) return value;
@@ -138,6 +149,7 @@ function getAllPreferences() {
     autoLaunch: getAutoLaunch(),
     refreshMs: getRefreshMs(),
     allUsers: getAllUsers(),
+    includeNonListening: getIncludeNonListening(),
     displayMode: getDisplayMode(),
     processTypes: getProcessTypes(),
   };
@@ -154,6 +166,8 @@ module.exports = {
   setRefreshMs,
   getAllUsers,
   setAllUsers,
+  getIncludeNonListening,
+  setIncludeNonListening,
   getDisplayMode,
   setDisplayMode,
   getProcessTypes,

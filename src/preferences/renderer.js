@@ -3,6 +3,7 @@ const prefsApi = window.nodeKillerPrefs;
 const autoLaunchCheckbox = document.querySelector('#autoLaunch');
 const autoLaunchHint = document.querySelector('#autoLaunchHint');
 const allUsersCheckbox = document.querySelector('#allUsers');
+const includeNonListeningCheckbox = document.querySelector('#includeNonListening');
 const refreshRadios = Array.from(document.querySelectorAll('input[name="refreshMs"]'));
 const displayModeRadios = Array.from(document.querySelectorAll('input[name="displayMode"]'));
 const processNodeCheckbox = document.querySelector('#processNode');
@@ -17,6 +18,7 @@ let state = {
   autoLaunch: false,
   refreshMs: 5000,
   allUsers: false,
+  includeNonListening: true,
   displayMode: 'number',
   processTypes: {
     node: true,
@@ -46,6 +48,7 @@ function applyMeta() {
 function applyState() {
   autoLaunchCheckbox.checked = Boolean(state.autoLaunch);
   allUsersCheckbox.checked = Boolean(state.allUsers);
+  includeNonListeningCheckbox.checked = state.includeNonListening !== false;
 
   refreshRadios.forEach((radio) => {
     const value = radio.value === 'paused' ? 'paused' : Number(radio.value);
@@ -99,6 +102,16 @@ async function handleToggleAllUsers(event) {
   }
 }
 
+async function handleToggleIncludeNonListening(event) {
+  try {
+    const payload = await prefsApi.setIncludeNonListening(event.target.checked);
+    updateFromPayload(payload);
+  } catch (error) {
+    console.error('Failed to update include non-listening preference:', error);
+    await init();
+  }
+}
+
 async function handleRefreshChange(event) {
   if (!event.target.checked) return;
   const raw = event.target.value;
@@ -144,6 +157,7 @@ async function init() {
 
 autoLaunchCheckbox.addEventListener('change', handleToggleAutoLaunch);
 allUsersCheckbox.addEventListener('change', handleToggleAllUsers);
+includeNonListeningCheckbox.addEventListener('change', handleToggleIncludeNonListening);
 refreshRadios.forEach((radio) => {
   radio.addEventListener('change', handleRefreshChange);
 });
